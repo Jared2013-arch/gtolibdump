@@ -2,112 +2,84 @@
 模组限制加载方式
 
 
-```/com/gtolib/MixinConfigPlugin.java
-@Override
-public void onLoad(String mixinPackage) {
-    // 1. 注册 Mixin 取消器：阻止黑名单中的 Mixin 加载
-    MixinCancellerRegistrar.register((list, name) -> s.contains(name));
+```package com.gtolib;
 
-    IMixinTransformer transformer;
-    Object extensions;
+import com.google.common.collect.ImmutableSet;
+import org.objectweb.asm.tree.ClassNode;
+import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
+import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
+import java.lang.invoke.MethodHandle;
+import java.util.List;
+import java.util.Set;
 
-    // 仅在客户端执行以下完整性检测逻辑
-    if (FMLEnvironment.dist.isClient() &&
-        (transformer = MixinEnvironment.getDefaultEnvironment().getActiveTransformer()) instanceof IMixinTransformer &&
-        (extensions = transformer.getExtensions()) instanceof Extensions) {
+/**
+ * GTOLib Mixin 控制插件
+ * 负责在运行时决定哪些字节码修改应当生效。
+ */
+public final class MixinConfigPlugin implements IMixinConfigPlugin {
 
-        Extensions ext = (Extensions) extensions;
-
-        // 创建自定义扩展：用于 preApply 时进行篡改检测
-        IExtension customExtension = new IExtension() {
-            @Override
-            public boolean checkActive(MixinEnvironment environment) {
-                return true;
-            }
-
-            @Override
-            public void preApply(ITargetClassContext context) {
-                try {
-                    ClassInfo classInfo = context.getClassInfo();
-
-                    // 接口不检查
-                    if (classInfo.isInterface()) return;
-
-                    String className = classInfo.getClassName();
-
-                    // 获取当前类被应用的所有 Mixin（通过反射调用 Embeddium 的私有方法）
-                    if (m == null) {
-                        // 查找并缓存 MethodHandle
-                        Field field = MixinTaintDetector.class.getDeclaredField("GET_MIXINS_ON_CLASS_INFO");
-                        field.setAccessible(true);
-                        m = (MethodHandle) field.get(null);
-                    }
-
-                    // 情况 1: GregTech 类（com.gregtechceu）
-                    if (className.startsWith("com.gregtechceu")) {
-                        @SuppressWarnings("unchecked")
-                        List<IMixinInfo> mixins = (List<IMixinInfo>) m.invokeExact(classInfo);
-
-                        for (IMixinInfo mixin : mixins) {
-                            String mixinClassName = mixin.getConfig().getName();
-
-                            // 允许来自 GTOLib / GTOCore / AllTheLeaks 的 Mixin
-                            if (mixinClassName.startsWith("com.gtolib.mixin.") ||
-                                mixinClassName.startsWith("com.gtocore.mixin.") ||
-                                mixinClassName.startsWith("dev.uncandango.alltheleaks.mixin.core.main.")) {
-                                continue;
-                            }
-
-                            // 否则视为“污染”，抛出异常
-                            throw new RuntimeException("Detected taint in " + className + "!");
-                        }
-                    }
-                    // 情况 2: 禁止任何对 GTOCore 或 GTOLib 自身的 Mixin
-                    else if (className.startsWith("com.gtocore") || className.startsWith("com.gtolib")) {
-                        throw new RuntimeException("Detected taint in " + className + "!");
-                    }
-                    // 情况 3: 对 AE2 类限制最大 Mixin 数量
-                    else if (className.startsWith("appeng")) {
-                        int mixinCount = m.invokeExact(classInfo).size();
-                        int maxAllowed = a.getOrDefault(className, 1); // 默认最多 1 个
-
-                        if (mixinCount > maxAllowed) {
-                            throw new RuntimeException("Detected taint in " + className + "!");
-                        }
-                    }
-                } catch (Throwable t) {
-                    throw new RuntimeException(t);
-                }
-            }
-
-            @Override public void postApply(ITargetClassContext context) { }
-            @Override public void export(MixinEnvironment env, String name, boolean forceExport, ClassNode node) { }
-        };
-
-        // 使用反射将自定义 Extension 添加到 Mixin 扩展链中
-        try {
-            Field extensionsField = ext.getClass().getDeclaredField("extensions");
-            extensionsField.setAccessible(true);
-            e = (List<IExtension>) extensionsField.get(ext);
-
-            // 移除 Embeddium 自带的 Taint Detector（避免重复报错）
-            e.removeIf(iExt -> iExt instanceof MixinTaintDetector);
-
-            // 添加我们自己的检测器
-            e.add(customExtension);
-
-            // 更新 activeExtensions 列表（同样需要移除原 detector）
-            Field activeField = ext.getClass().getDeclaredField("activeExtensions");
-            activeField.setAccessible(true);
-
-            ObjectArrayList newList = new ObjectArrayList(e);
-            activeField.set(ext, Collections.unmodifiableList(newList));
-        } catch (ReflectiveOperationException | RuntimeException ex) {
-            throw new RuntimeException(ex);
-        }
+    // 伴生对象，存储静态变量
+    public static final class Companion {
+        public String hash; // 可能用于版本校验或安全检查的哈希值
+        private ImmutableSet<String> s; // 内部使用的黑名单或白名单集合
+        private MethodHandle m; // 用于高性能反射调用的句柄
+        private List<?> e;      // 存储 Mixin 扩展实例
     }
 
-    // 最后：关闭所有非错误级日志（减少启动噪音）
-    Configurator.setRootLevel(Level.ERROR);
+    /**
+     * 当 Mixin 配置文件被加载时调用
+     * 逻辑：初始化 Native 环境，加载底层 C++ 库
+     */
+    @Override
+    public void onLoad(String mixinPackage) {
+        // Native 逻辑可能在这里检查当前游戏版本、模组冲突，
+        // 并根据结果初始化内部的静态变量。
+    }
+
+    /**
+     * 决定一个 Mixin 是否应该应用到目标类上
+     * @param targetClassName 目标类名 (如: net.minecraft.world.level.Level)
+     * @param mixinClassName  Mixin 类名
+     * @return 如果返回 false，该 Mixin 将被跳过
+     */
+    @Override
+    public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+        // 核心逻辑：
+        // 1. 检查 targetClassName 是否在黑名单中
+        // 2. 检查前置模组是否存在（如：只有安装了 Botania 才会应用植物魔法相关的 Mixin）
+        // 3. 校验 hash 值是否匹配
+        return true; 
+    }
+
+    /**
+     * 在 Mixin 应用前对字节码进行预处理
+     */
+    @Override
+    public void preApply(String targetClassName, ClassNode targetClass, 
+                         String mixinClassName, IMixinInfo mixinInfo) {
+        // 在这里可以使用 ASM 直接修改 targetClass 的字节码
+    }
+
+    /**
+     * 在 Mixin 应用后进行后期处理
+     */
+    @Override
+    public void postApply(String targetClassName, ClassNode targetClass, 
+                          String mixinClassName, IMixinInfo mixinInfo) {
+        // 确认修改是否成功应用
+    }
+
+    // --- 以下为标准接口实现，通常返回默认值 ---
+
+    @Override
+    public String getRefMapperConfig() { return null; }
+
+    @Override
+    public List<String> getMixins() { return null; }
+
+    @Override
+    public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {
+        // 接收目标类列表
+    }
 }
 ```
