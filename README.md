@@ -4,82 +4,95 @@
 
 ```package com.gtolib;
 
-import com.google.common.collect.ImmutableSet;
-import org.objectweb.asm.tree.ClassNode;
-import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
-import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
-import java.lang.invoke.MethodHandle;
+import com.google.common.collect.ImmutableList;
+import com.gtolib.api.annotation.DataGeneratorScanned;
+import com.gtolib.api.misc.AbstractMixinConfigPlugin;
+import com.gtolib.utils.reflect.FieldReference;
+import com.gtolib.utils.reflect.MethodReference;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import net.minecraftforge.fml.loading.FMLLoader;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.spongepowered.asm.mixin.MixinEnvironment;
+import org.spongepowered.asm.mixin.transformer.IMixinTransformer;
+import org.spongepowered.asm.mixin.transformer.ext.Extensions;
+import org.spongepowered.asm.mixin.transformer.ext.IExtension;
+import org.spongepowered.asm.mixin.transformer.ext.IExtensionRegistry;
 
-/**
- * GTOLib Mixin 控制插件
- * 负责在运行时决定哪些字节码修改应当生效。
- */
-public final class MixinConfigPlugin implements IMixinConfigPlugin {
+@DataGeneratorScanned
+public final class MixinConfigPlugin extends AbstractMixinConfigPlugin {
 
-    // 伴生对象，存储静态变量
-    public static final class Companion {
-        public String hash; // 可能用于版本校验或安全检查的哈希值
-        private ImmutableSet<String> s; // 内部使用的黑名单或白名单集合
-        private MethodHandle m; // 用于高性能反射调用的句柄
-        private List<?> e;      // 存储 Mixin 扩展实例
-    }
+   private static final Logger LOGGER = LoggerFactory.getLogger("GTO Core");
+   public static String hash = null;
 
-    /**
-     * 当 Mixin 配置文件被加载时调用
-     * 逻辑：初始化 Native 环境，加载底层 C++ 库
-     */
-    @Override
-    public void onLoad(String mixinPackage) {
-        // Native 逻辑可能在这里检查当前游戏版本、模组冲突，
-        // 并根据结果初始化内部的静态变量。
-    }
+   @Override
+   public void onLoad(String mixinPackage) {
+      try {
+         ClassLoader classLoader = this.getClass().getClassLoader();
+         
+         MethodReference.fromClass(classLoader.loadClass("gto.native0.plugins.GTOProvider"),
+                         "init_gtolib", ClassLoader.class)
+                 .invoke(classLoader);
 
-    /**
-     * 决定一个 Mixin 是否应该应用到目标类上
-     * @param targetClassName 目标类名 (如: net.minecraft.world.level.Level)
-     * @param mixinClassName  Mixin 类名
-     * @return 如果返回 false，该 Mixin 将被跳过
-     */
-    @Override
-    public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
-        // 核心逻辑：
-        // 1. 检查 targetClassName 是否在黑名单中
-        // 2. 检查前置模组是否存在（如：只有安装了 Botania 才会应用植物魔法相关的 Mixin）
-        // 3. 校验 hash 值是否匹配
-        return true; 
-    }
+        
+         if (FMLLoader.isProduction()) {
+            Configurator.setRootLevel(Level.ERROR);
+         }
 
-    /**
-     * 在 Mixin 应用前对字节码进行预处理
-     */
-    @Override
-    public void preApply(String targetClassName, ClassNode targetClass, 
-                         String mixinClassName, IMixinInfo mixinInfo) {
-        // 在这里可以使用 ASM 直接修改 targetClass 的字节码
-    }
+         
+         IMixinTransformer transformer = (IMixinTransformer) MixinEnvironment.getDefaultEnvironment()
+                 .getActiveTransformer();
+         Extensions extensions = (Extensions) transformer.getExtensions();
+         Object CustomExtensionProvider;
+         extensions.add(CustomExtensionProvider.CUSTOM_EXTENSION);
+      } catch (Throwable t) {
+         throw new RuntimeException("Failed to load MixinConfigPlugin", t);
+      }
+   }
 
-    /**
-     * 在 Mixin 应用后进行后期处理
-     */
-    @Override
-    public void postApply(String targetClassName, ClassNode targetClass, 
-                          String mixinClassName, IMixinInfo mixinInfo) {
-        // 确认修改是否成功应用
-    }
+   @Override
+   public List<String> getMixins() {
+      try {
+         removeCustomExtensions();
+         return null; 
+      } catch (Throwable t) {
+         throw new RuntimeException("Failed to get mixins", t);
+      }
+   }
 
-    // --- 以下为标准接口实现，通常返回默认值 ---
+   @Override
+   public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+      return true;
+   }
+   
+   private static void removeCustomExtensions() {
+      IMixinTransformer transformer = (IMixinTransformer) MixinEnvironment.getDefaultEnvironment()
+              .getActiveTransformer();
+      IExtensionRegistry registry = transformer.getExtensions();
 
-    @Override
-    public String getRefMapperConfig() { return null; }
+      
+      FieldReference extensionMapField = FieldReference.fromInstance(registry, "extensionMap");
+      Map<?, ?> extensionMap = (Map<?, ?>) extensionMapField.get();
+      extensionMap.entrySet().removeIf(entry ->
+              CustomExtensionProvider.IS_CUSTOM.test((IExtension) entry.getValue())
+      );
 
-    @Override
-    public List<String> getMixins() { return null; }
+     
+      FieldReference extensionsField = FieldReference.fromInstance(registry, "extensions");
+      List<IExtension> extensions = (List<IExtension>) extensionsField.get();
+      extensions.removeIf(CustomExtensionProvider.IS_CUSTOM);
 
-    @Override
-    public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {
-        // 接收目标类列表
-    }
+      
+      FieldReference activeExtensionsField = FieldReference.fromInstance(registry, "activeExtensions");
+      Collection<IExtension> activeExtensions = new ArrayList<>((Collection<IExtension>) activeExtensionsField.get());
+      activeExtensions.removeIf(CustomExtensionProvider.IS_CUSTOM);
+      activeExtensionsField.set(ImmutableList.copyOf(activeExtensions));
+   }
 }
+
 ```
